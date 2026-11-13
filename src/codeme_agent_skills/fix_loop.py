@@ -85,6 +85,43 @@ class FixLoopRunner:
             repaired=("--fix" in cmd and proc.returncode == 0),
         )
 
+    def _finish_result(
+        self,
+        status: str,
+        exit_code: int,
+        steps: List[StepResult],
+        diagnostics: List[str],
+        start_time: float,
+    ) -> FixLoopResult:
+        """Build FixLoopResult and persist run telemetry to .codeme/logs/."""
+        duration_total_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        try:
+            from codeme.core.audit import AuditLog, AuditLogger, TokenMetrics, generate_run_id
+            raw_bytes = sum(len((s.stdout + s.stderr).encode("utf-8")) for s in steps)
+            returned_bytes = len("\n".join(diagnostics).encode("utf-8")) if diagnostics else 0
+            logger = AuditLogger(log_dir=self.repo_path / ".codeme" / "logs")
+            metrics = TokenMetrics.calculate(raw_output_bytes=raw_bytes, returned_bytes=returned_bytes)
+            entry = AuditLog(
+                run_id=generate_run_id(),
+                tool_or_command="codeme-fix-loop",
+                exit_code=exit_code,
+                duration_ms=duration_total_ms,
+                metrics=metrics,
+                diagnostics_count=len(diagnostics),
+                metadata={"steps": [s.step_name for s in steps]},
+            )
+            logger.record_run(entry)
+        except Exception:
+            pass
+
+        return FixLoopResult(
+            status=status,
+            exit_code=exit_code,
+            steps=steps,
+            diagnostics=diagnostics,
+            duration_total_ms=duration_total_ms,
+        )
+
     def run(
         self,
         target_file: Optional[str] = None,
@@ -114,13 +151,7 @@ class FixLoopRunner:
                 if syntax_res.exit_code != 0:
                     diag = syntax_res.stderr.strip() or syntax_res.stdout.strip() or f"Syntax verification failed on {tf}."
                     diagnostics.append(f"[CDM-SYN] {diag}")
-                    return FixLoopResult(
-                        status="failure",
-                        exit_code=syntax_res.exit_code,
-                        steps=steps,
-                        diagnostics=diagnostics,
-                        duration_total_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
-                    )
+                    return self._finish_result("failure", syntax_res.exit_code, steps, diagnostics, start_time)
         else:
             syntax_cmd = [bin_syntax, "run", "--fix", "--repo", str(self.repo_path)]
             syntax_res = self._execute_command(syntax_cmd)
@@ -128,13 +159,7 @@ class FixLoopRunner:
             if syntax_res.exit_code != 0:
                 diag = syntax_res.stderr.strip() or syntax_res.stdout.strip() or "Syntax verification failed."
                 diagnostics.append(f"[CDM-SYN] {diag}")
-                return FixLoopResult(
-                    status="failure",
-                    exit_code=syntax_res.exit_code,
-                    steps=steps,
-                    diagnostics=diagnostics,
-                    duration_total_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
-                )
+                return self._finish_result("failure", syntax_res.exit_code, steps, diagnostics, start_time)
 
         # 2. Quality Engine (with --fix)
         if files_to_check:
@@ -145,13 +170,7 @@ class FixLoopRunner:
                 if quality_res.exit_code != 0:
                     diag = quality_res.stderr.strip() or quality_res.stdout.strip() or f"Quality verification failed on {tf}."
                     diagnostics.append(f"[CDM-QLT] {diag}")
-                    return FixLoopResult(
-                        status="failure",
-                        exit_code=quality_res.exit_code,
-                        steps=steps,
-                        diagnostics=diagnostics,
-                        duration_total_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
-                    )
+                    return self._finish_result("failure", quality_res.exit_code, steps, diagnostics, start_time)
         else:
             quality_cmd = [bin_quality, "run", "--fix", "--repo", str(self.repo_path)]
             quality_res = self._execute_command(quality_cmd)
@@ -159,13 +178,7 @@ class FixLoopRunner:
             if quality_res.exit_code != 0:
                 diag = quality_res.stderr.strip() or quality_res.stdout.strip() or "Quality verification failed."
                 diagnostics.append(f"[CDM-QLT] {diag}")
-                return FixLoopResult(
-                    status="failure",
-                    exit_code=quality_res.exit_code,
-                    steps=steps,
-                    diagnostics=diagnostics,
-                    duration_total_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
-                )
+                return self._finish_result("failure", quality_res.exit_code, steps, diagnostics, start_time)
 
         # 3. Verify Engine (builds and targeted tests with --fix)
         verify_cmd = [bin_verify, "run", "--repo", str(self.repo_path), "--fix"]
@@ -174,13 +187,7 @@ class FixLoopRunner:
         if verify_res.exit_code != 0:
             diag = verify_res.stderr.strip() or verify_res.stdout.strip() or "Build or test verification failed."
             diagnostics.append(f"[CDM-VRF] {diag}")
-            return FixLoopResult(
-                status="failure",
-                exit_code=verify_res.exit_code,
-                steps=steps,
-                diagnostics=diagnostics,
-                duration_total_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
-            )
+            return self._finish_result("failure", verify_res.exit_code, steps, diagnostics, start_time)
 
         # 4. Invariant Engine (database migrations, golden baseline, state machines)
         invariant_cmd = [bin_invariant, "run", "--repo", str(self.repo_path), "--class", "all"]
@@ -189,19 +196,6 @@ class FixLoopRunner:
         if invariant_res.exit_code != 0:
             diag = invariant_res.stderr.strip() or invariant_res.stdout.strip() or "Invariant verification failed."
             diagnostics.append(f"[CDM-INV] {diag}")
-            return FixLoopResult(
-                status="failure",
-                exit_code=invariant_res.exit_code,
-                steps=steps,
-                diagnostics=diagnostics,
-                duration_total_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
-            )
+            return self._finish_result("failure", invariant_res.exit_code, steps, diagnostics, start_time)
 
-        total_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
-        return FixLoopResult(
-            status="success",
-            exit_code=0,
-            steps=steps,
-            diagnostics=[],
-            duration_total_ms=total_ms,
-        )
+        return self._finish_result("success", 0, steps, [], start_time)
